@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC Mesh Video</title>
+    <style>
+        body { margin: 0; padding: 0; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; background-color: #3abfc6; font-family: Arial, sans-serif; color: #fff; padding-top: 40px; }
+        #video-container { display: flex; flex-direction: column; text-align: center; width: 90%; max-width: 1000px; }
+        input { padding: 8px; font-size: 16px; margin: 6px; }
+        video { width: 100%; max-width: 300px; background-color: #222; border-radius: 8px; display: block; margin: 5px auto; }
+        button { margin: 10px 6px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        #local-player { width: 80%; margin: 0 auto;}
+        #participants { display: flex; flex-direction: row; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 18px; }
+        .participant { background: #111; border-radius: 8px; padding: 8px; width: 320px; position: relative; box-sizing: border-box; text-align: center; }
+        .participant .label { font-size: 14px; margin-bottom: 6px; color: #ddd; }
+    </style>
+</head>
+<body>
+    <div id="video-container">
+        <div>
+            <input type="text" id="room-id" placeholder="Room ID" value="TEST1" />
+            <input type="text" id="name" placeholder="Your Name" value="User" />
+            <button id="join-btn">Join / Create Room</button>
+            <button id="stop-btn" disabled>Leave</button>
+        </div>
+
+        <div id="local-player" class="participant">
+            <div class="label">Me</div>
+            <video id="local-video" playsinline autoplay muted></video>
+        </div>
+
+        <div id="participants"></div>
+    </div>
+
+    <script>
+        const WS_URL = 'ws://192.168.50.163:3000';
+        const localVideo = document.getElementById('local-video');
+        const participantsContainer = document.getElementById('participants');
+        const roomIdInput = document.getElementById('room-id');
+        const nameInput = document.getElementById('name');
+        const joinBtn = document.getElementById('join-btn');
+        const stopBtn = document.getElementById('stop-btn');
+
+        let localStream = null;
+        let ws = null;
+        let myUserId = null;
+        
+        // Map<userId, RTCPeerConnection>
+        const peerConnections = new Map();
+
+        // ICE Config (Use Google STUN for testing)
+        const rtcConfig = {
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        };
+
+        // 1. Get Local Stream
+        async function startLocalStream() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                localVideo.srcObject = localStream;
+            } catch (err) {
+                console.error('Error accessing media:', err);
+                alert('Camera/Mic access required.');
+            }
+        }
+        startLocalStream();
+
+        joinBtn.onclick = () => {
+            const roomId = roomIdInput.value.trim();
+            const name = nameInput.value.trim();
+            if (!roomId || !name) return alert("Enter Room ID and Name");
+            if (!localStream) return alert("Waiting for camera...");
+
+            connectSignal(roomId, name);
+            let label = document.querySelector("#local-player .label");
+            label.innerHTML = `Me (${name})`
+            joinBtn.disabled = true;
+            stopBtn.disabled = false;
+        };
+
+        stopBtn.onclick = () => {
+            if(ws) ws.close();
+            cleanup();
+            joinBtn.disabled = false;
+            stopBtn.disabled = true;
+        };
+
+        function cleanup() {
+            peerConnections.forEach(pc => pc.close());
+            peerConnections.clear();
+            participantsContainer.innerHTML = '';
+            myUserId = null;
+        }
+
+        // 2. Connect to WebSocket
+        function connectSignal(roomId, name) {
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                console.log("Connected to WS");
+                // Send Join message
+                ws.send(JSON.stringify({ type: 'join', roomId, name }));
+            };
+
+            ws.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+                
+                switch (data.type) {
+                    case 'existing-participants':
+                        myUserId = data.myUserId;
+                        console.log('Joined. My ID:', myUserId);
+                        // I am the new joiner. I must offer to everyone already here.
+                        data.participants.forEach(async (p) => {
+                            await createPeerConnection(p.userId, p.name, true); // true = initiator
+                        });
+                        break;
+
+                    case 'user-joined':
+                        // Someone else joined. I do nothing. I wait for their offer.
+                        console.log('User joined:', data.name);
+                        break;
+
+                    case 'offer':
+                        await handleOffer(data);
+                        break;
+
+                    case 'answer':
+                        await handleAnswer(data);
+                        break;
+
+                    case 'candidate':
+                        await handleCandidate(data);
+                        break;
+
+                    case 'user-left':
+                        removeParticipant(data.userId);
+                        break;
+                }
+            };
+
+            ws.onerror = (e) => console.error("WS Error", e);
+        }
+
+        // 3. WebRTC Logic
+        async function createPeerConnection(targetUserId, targetName, isInitiator) {
+            const pc = new RTCPeerConnection(rtcConfig);
+            peerConnections.set(targetUserId, pc);
+
+            // Add local tracks
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+            // Handle ICE candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'candidate',
+                        targetUserId: targetUserId,
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            // Handle remote stream
+            pc.ontrack = (event) => {
+                createRemoteVideo(targetUserId, targetName, event.streams[0]);
+            };
+
+            if (isInitiator) {
+                // Create Offer
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    targetUserId: targetUserId,
+                    offer: pc.localDescription
+                }));
+            }
+
+            return pc;
+        }
+
+        async function handleOffer(data) {
+            // We received an offer, so we are NOT the initiator.
+            // Create PC, set remote desc, create answer.
+            const pc = await createPeerConnection(data.senderUserId, data.senderName, false);
+            
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            
+            ws.send(JSON.stringify({
+                type: 'answer',
+                targetUserId: data.senderUserId,
+                answer: pc.localDescription
+            }));
+        }
+        
+        // Every other user sends an answer back to sender's pc
+        async function handleAnswer(data) {
+            const pc = peerConnections.get(data.senderUserId);
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
+        }
+
+        async function handleCandidate(data) {
+            const pc = peerConnections.get(data.senderUserId);
+            if (pc) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                } catch (e) {
+                    console.error("Error adding ice candidate", e);
+                }
+            }
+        }
+
+        // 4. UI Helpers
+        function createRemoteVideo(userId, name, stream) {
+            // Check if exists to prevent duplicates
+            if (document.getElementById(`container-${userId}`)) return;
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'participant';
+            wrapper.id = `container-${userId}`;
+            
+            const label = document.createElement('div');
+            label.className = 'label';
+            label.textContent = name;
+
+            const video = document.createElement('video');
+            video.id = `video-${userId}`;
+            video.autoplay = true;
+            video.playsInline = true;
+            video.srcObject = stream;
+
+            wrapper.appendChild(label);
+            wrapper.appendChild(video);
+            participantsContainer.appendChild(wrapper);
+        }
+
+        function removeParticipant(userId) {
+            const pc = peerConnections.get(userId);
+            if (pc) {
+                pc.close();
+                peerConnections.delete(userId);
+            }
+            const el = document.getElementById(`container-${userId}`);
+            if (el) el.remove();
+        }
+    </script>
+</body>
+</html>
